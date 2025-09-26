@@ -14,7 +14,7 @@ setuptools.setup(
     packages=setuptools.find_packages(),
 
     install_requires=[
-        "SQLAlchemy>=1.2,<2",
+        "SQLAlchemy>2",
     ],
 
     classifiers=[
