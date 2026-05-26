@@ -1,28 +1,33 @@
 from typing import Optional, Tuple, Any, Union
 
+import sqlalchemy as sql
+from sqlalchemy import Column, String, Integer, BigInteger, LargeBinary, orm, func, select, and_, \
+    inspect, create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm.scoping import scoped_session
-from sqlalchemy import Column, String, Integer, BigInteger, LargeBinary, orm, func, select, and_
-import sqlalchemy as sql
 
-from .orm import AlchemySession
 from .core import AlchemyCoreSession
 from .core_mysql import AlchemyMySQLCoreSession
-from .core_sqlite import AlchemySQLiteCoreSession
 from .core_postgres import AlchemyPostgresCoreSession
+from .core_sqlite import AlchemySQLiteCoreSession
+from .orm import AlchemySession
 
-LATEST_VERSION = 2
+LATEST_VERSION = 7
 
 
 class AlchemySessionContainer:
-    def __init__(self, engine: Union[sql.engine.Engine, str] = None,
-                 session: Optional[Union[orm.Session, scoped_session, bool]] = None,
-                 table_prefix: str = "", table_base: Optional[declarative_base] = None,
-                 manage_tables: bool = True) -> None:
+    def __init__(
+        self, engine: Union[sql.engine.Engine, str] = None,
+        session: Optional[Union[orm.Session, scoped_session, bool]] = None,
+        table_prefix: str = "", table_base: Optional[declarative_base] = None,
+        manage_tables: bool = True,
+        schema: Optional[str] = None,
+    ) -> None:
         if isinstance(engine, str):
-            engine = sql.create_engine(engine)
+            engine = create_engine(engine)
 
         self.db_engine = engine
+        self.schema = schema
         if session is None:
             db_factory = orm.sessionmaker(bind=self.db_engine)
             self.db = orm.scoping.scoped_session(db_factory)
@@ -31,7 +36,15 @@ class AlchemySessionContainer:
         else:
             self.db = session
 
-        table_base = table_base or declarative_base()
+        if table_base is None:
+            if schema:
+                metadata = sql.MetaData(schema=schema)
+                table_base = declarative_base(metadata=metadata)
+            else:
+                table_base = declarative_base()
+        else:
+            if schema and table_base.metadata.schema is None:
+                table_base.metadata.schema = schema
         (self.Version, self.Session, self.Entity,
          self.SentFile, self.UpdateState) = self.create_table_classes(self.db, table_prefix,
                                                                       table_base)
@@ -44,9 +57,9 @@ class AlchemySessionContainer:
             if not self.db:
                 raise ValueError("Can't manage tables without an ORM session.")
             table_base.metadata.bind = self.db_engine
-            if not self.db_engine.dialect.has_table(self.db_engine,
-                                                    self.Version.__tablename__):
-                table_base.metadata.create_all()
+            inspector = inspect(engine)
+            if not inspector.has_table(self.Version.__tablename__, schema=self.schema):
+                table_base.metadata.create_all(bind=self.db_engine)
                 self.db.add(self.Version(version=LATEST_VERSION))
                 self.db.commit()
             else:
@@ -187,7 +200,7 @@ class AlchemySessionContainer:
             return self.Session.query.filter(self.Session.session_id == session_id).count() > 0
 
     def list_sessions(self):
-        return
+        return self.Session.query.all()
 
     def save(self) -> None:
         if self.db:

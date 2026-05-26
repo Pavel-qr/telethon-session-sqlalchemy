@@ -1,11 +1,11 @@
-from typing import Optional, Tuple, Any, Union, TYPE_CHECKING
 import datetime
+from typing import Optional, Tuple, Any, Union, TYPE_CHECKING
 
 from sqlalchemy import orm
-
-from telethon.sessions.memory import MemorySession, _SentFileType
+from sqlalchemy.exc import IntegrityError
 from telethon import utils
 from telethon.crypto import AuthKey
+from telethon.sessions.memory import MemorySession, _SentFileType
 from telethon.tl.types import InputPhoto, InputDocument, PeerUser, PeerChat, PeerChannel, updates
 
 if TYPE_CHECKING:
@@ -103,7 +103,10 @@ class AlchemySession(MemorySession):
             return
 
         for row in rows:
-            self.db.merge(row)
+            try:
+                self.db.merge(row)
+            except IntegrityError:
+                self.db.rollback()
         self.save()
 
     def get_entity_rows_by_phone(self, key: str) -> Optional[Tuple[int, int]]:
