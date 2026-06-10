@@ -2,9 +2,10 @@ from typing import Optional, Tuple, Any, Union
 
 import sqlalchemy as sql
 from sqlalchemy import Column, String, Integer, BigInteger, LargeBinary, orm, func, select, and_, \
-    inspect, create_engine
-from sqlalchemy.ext.declarative import declarative_base
+    inspect, create_engine, text
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm.scoping import scoped_session
+from sqlalchemy.schema import CreateSchema
 
 from .core import AlchemyCoreSession
 from .core_mysql import AlchemyMySQLCoreSession
@@ -54,14 +55,12 @@ class AlchemySessionContainer:
             self.core_mode = True
 
         if manage_tables:
-            if not self.db:
-                raise ValueError("Can't manage tables without an ORM session.")
-            table_base.metadata.bind = self.db_engine
-            inspector = inspect(engine)
+            # Работает и в ORM-, и в core-режиме (без ORM-сессии — через engine напрямую).
+            self._create_schema_if_needed()
+            inspector = inspect(self.db_engine)
             if not inspector.has_table(self.Version.__tablename__, schema=self.schema):
                 table_base.metadata.create_all(bind=self.db_engine)
-                self.db.add(self.Version(version=LATEST_VERSION))
-                self.db.commit()
+                self._set_version(LATEST_VERSION)
             else:
                 self.check_and_upgrade_database()
 
@@ -159,28 +158,56 @@ class AlchemySessionContainer:
 
         return Version, Session, Entity, SentFile, UpdateState
 
+    def _create_schema_if_needed(self) -> None:
+        # postgres/mysql: создать схему, если задана и её ещё нет. У sqlite схем нет.
+        if not self.schema or self.db_engine.dialect.name == "sqlite":
+            return
+        with self.db_engine.begin() as conn:
+            conn.execute(CreateSchema(self.schema, if_not_exists=True))
+
+    def _set_version(self, version: int) -> None:
+        if self.db:
+            self.db.add(self.Version(version=version))
+            self.db.commit()
+        else:
+            with self.db_engine.begin() as conn:
+                conn.execute(self.Version.__table__.insert().values(version=version))
+
+    def _get_version(self) -> int:
+        if self.db:
+            rows = self.Version.query.all()
+            return rows[0].version if rows else 1
+        t = self.Version.__table__
+        with self.db_engine.connect() as conn:
+            row = conn.execute(select(t.c.version)).first()
+        return row[0] if row is not None else 1
+
     def _add_column(self, table: Any, column: Column) -> None:
         column_name = column.compile(dialect=self.db_engine.dialect)
         column_type = column.type.compile(self.db_engine.dialect)
-        self.db_engine.execute("ALTER TABLE {} ADD COLUMN {} {}".format(
-            table.__tablename__, column_name, column_type))
+        with self.db_engine.begin() as conn:
+            conn.execute(text("ALTER TABLE {} ADD COLUMN {} {}".format(
+                table.__tablename__, column_name, column_type)))
 
     def check_and_upgrade_database(self) -> None:
-        row = self.Version.query.all()
-        version = row[0].version if row else 1
+        version = self._get_version()
         if version == LATEST_VERSION:
             return
 
-        self.Version.query.delete()
+        if self.db:
+            self.Version.query.delete()
+            self.db.commit()
+        else:
+            with self.db_engine.begin() as conn:
+                conn.execute(self.Version.__table__.delete())
 
         if version == 1:
             self.UpdateState.__table__.create(self.db_engine)
             version = 3
         elif version == 2:
-            self._add_column(self.UpdateState, Column(type=Integer, name="unread_count"))
+            self._add_column(self.UpdateState, Column("unread_count", Integer))
 
-        self.db.add(self.Version(version=version))
-        self.db.commit()
+        self._set_version(version)
 
     def new_session(self, session_id: str) -> 'AlchemySession':
         return self.alchemy_session_class(self, session_id)
@@ -188,14 +215,12 @@ class AlchemySessionContainer:
     def has_session(self, session_id: str) -> bool:
         if self.core_mode:
             t = self.Session.__table__
-            rows = self.db_engine.execute(select([func.count(t.c.auth_key)])
-                                          .where(and_(t.c.session_id == session_id,
-                                                      t.c.auth_key != b'')))
-            try:
-                count, = next(rows)
-                return count > 0
-            except StopIteration:
-                return False
+            with self.db_engine.connect() as conn:
+                count = conn.execute(
+                    select(func.count(t.c.auth_key))
+                    .where(and_(t.c.session_id == session_id, t.c.auth_key != b''))
+                ).scalar()
+            return bool(count)
         else:
             return self.Session.query.filter(self.Session.session_id == session_id).count() > 0
 
