@@ -82,6 +82,11 @@ class AlchemySession(MemorySession):
     def save(self) -> None:
         self.container.save()
 
+    def rename(self, new_session_id: str) -> None:
+        """Переименовать текущую сессию, перенеся все связанные данные."""
+        self.container.rename_session(self.session_id, new_session_id)
+        self.session_id = new_session_id
+
     def close(self) -> None:
         # Nothing to do here, connection is managed by AlchemySessionContainer.
         pass

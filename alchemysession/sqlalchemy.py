@@ -1,8 +1,8 @@
 from typing import Optional, Tuple, Any, Union
 
 import sqlalchemy as sql
-from sqlalchemy import Column, String, Integer, BigInteger, LargeBinary, orm, func, select, and_, \
-    inspect, create_engine, text
+from sqlalchemy import Column, String, Integer, BigInteger, LargeBinary, ForeignKey, \
+    UniqueConstraint, orm, func, select, and_, inspect, create_engine, text
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm.scoping import scoped_session
 from sqlalchemy.schema import CreateSchema
@@ -89,6 +89,17 @@ class AlchemySessionContainer:
                              ) -> Tuple[Any, Any, Any, Any, Any]:
         qp = db.query_property() if db else None
 
+        schema = base.metadata.schema
+        session_fk_target = "{prefix}sessions.session_id".format(prefix=prefix)
+        if schema:
+            session_fk_target = "{schema}.{target}".format(schema=schema,
+                                                            target=session_fk_target)
+
+        def session_fk() -> ForeignKey:
+            # ON UPDATE CASCADE позволяет переименовывать сессию каскадно там, где
+            # СУБД действительно обеспечивает FK; rename_session не полагается на это.
+            return ForeignKey(session_fk_target, ondelete="CASCADE", onupdate="CASCADE")
+
         class Version(base):
             query = qp
             __tablename__ = "{prefix}version".format(prefix=prefix)
@@ -100,6 +111,9 @@ class AlchemySessionContainer:
         class Session(base):
             query = qp
             __tablename__ = '{prefix}sessions'.format(prefix=prefix)
+            # session_id уникален сам по себе (см. _update_session_table), что делает
+            # его допустимой целью внешнего ключа из дочерних таблиц.
+            __table_args__ = (UniqueConstraint("session_id"),)
 
             session_id = Column(String(255), primary_key=True)
             dc_id = Column(Integer, primary_key=True)
@@ -116,7 +130,7 @@ class AlchemySessionContainer:
             query = qp
             __tablename__ = '{prefix}entities'.format(prefix=prefix)
 
-            session_id = Column(String(255), primary_key=True)
+            session_id = Column(String(255), session_fk(), primary_key=True)
             id = Column(BigInteger, primary_key=True)
             hash = Column(BigInteger, nullable=False)
             username = Column(String(32))
@@ -132,7 +146,7 @@ class AlchemySessionContainer:
             query = qp
             __tablename__ = '{prefix}sent_files'.format(prefix=prefix)
 
-            session_id = Column(String(255), primary_key=True)
+            session_id = Column(String(255), session_fk(), primary_key=True)
             md5_digest = Column(LargeBinary, primary_key=True)
             file_size = Column(Integer, primary_key=True)
             type = Column(Integer, primary_key=True)
@@ -148,7 +162,7 @@ class AlchemySessionContainer:
             query = qp
             __tablename__ = "{prefix}update_state".format(prefix=prefix)
 
-            session_id = Column(String(255), primary_key=True)
+            session_id = Column(String(255), session_fk(), primary_key=True)
             entity_id = Column(BigInteger, primary_key=True)
             pts = Column(BigInteger)
             qts = Column(BigInteger)
@@ -226,6 +240,48 @@ class AlchemySessionContainer:
 
     def list_sessions(self):
         return self.Session.query.all()
+
+    def _session_row_exists(self, session_id: str) -> bool:
+        t = self.Session.__table__
+        if self.db:
+            return self.db.query(self.Session).filter(
+                self.Session.session_id == session_id).count() > 0
+        with self.db_engine.connect() as conn:
+            count = conn.execute(
+                select(func.count()).select_from(t).where(t.c.session_id == session_id)
+            ).scalar()
+        return bool(count)
+
+    def rename_session(self, old_session_id: str, new_session_id: str) -> None:
+        """Переименовать сессию: обновить session_id во всех связанных таблицах.
+
+        Работает и в ORM-, и в core-режиме. Обновление идёт сначала по таблице
+        sessions, затем по дочерним — это корректно как при включённом FK с
+        ON UPDATE CASCADE (дочерние обновятся каскадно, явный апдейт станет no-op),
+        так и без enforcement (например, SQLite по умолчанию), где дочерние строки
+        обновит наш явный апдейт.
+        """
+        if old_session_id == new_session_id:
+            return
+        if not self._session_row_exists(old_session_id):
+            raise ValueError("Session '{}' does not exist".format(old_session_id))
+        if self._session_row_exists(new_session_id):
+            raise ValueError("Session '{}' already exists".format(new_session_id))
+
+        tables = (self.Session, self.Entity, self.SentFile, self.UpdateState)
+        if self.db:
+            for table in tables:
+                self.db.query(table).filter(
+                    table.session_id == old_session_id
+                ).update({table.session_id: new_session_id}, synchronize_session=False)
+            self.db.commit()
+        else:
+            with self.db_engine.begin() as conn:
+                for table in tables:
+                    t = table.__table__
+                    conn.execute(
+                        t.update().where(t.c.session_id == old_session_id)
+                        .values(session_id=new_session_id))
 
     def save(self) -> None:
         if self.db:
